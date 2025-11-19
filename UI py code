@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+EROBOTA16 - FINAL RACING CONTROL UI
+Direct serial control with racing-style interface
+No websockets required - standalone application
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import time
+
+class RobotController:
+    def __init__(self):
+        self.ser = None
+        self.connected = False
+        self.throttle = 0.0
+        self.brake = 0.0
+        self.steering = 0.0
+        
+    def find_arduino(self):
+        """Auto-detect Arduino port"""
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            if any(x in p.description for x in ['Arduino', 'CH340', 'USB Serial', 'CP210']):
+                return p.device
+        return None
+    
+    def connect(self, port, baud=9600):
+        """Connect to Arduino"""
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            self.connected = True
+            time.sleep(2)  # Wait for Arduino reset
+            return True
+        except Exception as e:
+            print(f"Error: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect and stop motors"""
+        if self.ser and self.ser.is_open:
+            self.send_command(0, 0)
+            time.sleep(0.1)
+            self.ser.close()
+        self.connected = False
+    
+    def send_command(self, speed, turn):
+        """Send command to Arduino"""
+        if self.ser and self.ser.is_open:
+            try:
+                cmd = f"SPD:{speed};TURN:{turn}\n"
+                self.ser.write(cmd.encode())
+                return True
+            except:
+                return False
+        return False
+    
+    def update_motors(self):
+        """Calculate and send motor commands for differential drive"""
+        if not self.connected:
+            return None, None
+        
+        # Differential drive: steering changes relative speed between wheels
+        net_throttle = self.throttle - self.brake
+        base_speed = int(net_throttle * 255)
+        
+        # Steering affects wheel speed difference (tank turn)
+        # Full left/right steering = spin in place
+        turn_value = int(self.steering * 120)
+        
+        self.send_command(base_speed, turn_value)
+        
+        # Calculate actual wheel speeds
+        # When steering full left: right wheel full forward, left wheel backward = spin left
+        # When steering full right: left wheel full forward, right wheel backward = spin right
+        left_speed = max(-255, min(255, base_speed + turn_value))
+        right_speed = max(-255, min(255, base_speed - turn_value))
+        
+        return left_speed, right_speed
+
+class RacingUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("EROBOTA16 RACING CONTROL")
+        self.root.geometry("900x700")
+        self.root.configure(bg='#0d1117')
+        self.root.resizable(False, False)
+        
+        self.controller = RobotController()
+        
+        # Color scheme - ROG Ally inspired
+        self.bg_dark = '#0d1117'
+        self.bg_card = '#161b22'
+        self.accent_pink = '#ff0a54'
+        self.accent_cyan = '#00d9ff'
+        self.accent_green = '#00ff88'
+        self.accent_red = '#ff006e'
+        self.text_white = '#ffffff'
+        self.text_gray = '#8b949e'
+        
+        self.throttle_active = False
+        self.brake_active = False
+        self.steering_active = False
+        
+        self.create_ui()
+        self.update_loop()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+    
+    def create_ui(self):
+        # ============ HEADER ============
+        header = tk.Frame(self.root, bg=self.bg_card, height=100)
+        header.pack(fill=tk.X, padx=15, pady=15)
+        header.pack_propagate(False)
+        
+        # Title section
+        title_frame = tk.Frame(header, bg=self.bg_card)
+        title_frame.pack(side=tk.LEFT, padx=20)
+        
+        title = tk.Label(title_frame, text="EROBOTA16", 
+                        font=("Arial Black", 28, "bold"),
+                        fg=self.accent_pink, bg=self.bg_card)
+        title.pack(anchor='w')
+        
+        subtitle = tk.Label(title_frame, text="DIFFERENTIAL DRIVE SYSTEM", 
+                           font=("Arial", 11, "bold"),
+                           fg=self.accent_cyan, bg=self.bg_card)
+        subtitle.pack(anchor='w')
+        
+        drive_info = tk.Label(title_frame, text="2-Wheel Tank Control", 
+                            font=("Arial", 8),
+                            fg=self.text_gray, bg=self.bg_card)
+        drive_info.pack(anchor='w')
+        
+        # Connection panel
+        conn_panel = tk.Frame(header, bg=self.bg_dark, relief=tk.RAISED, bd=2)
+        conn_panel.pack(side=tk.RIGHT, padx=20, pady=10)
+        
+        port_frame = tk.Frame(conn_panel, bg=self.bg_dark)
+        port_frame.pack(padx=15, pady=10)
+        
+        tk.Label(port_frame, text="PORT:", font=("Arial", 9, "bold"),
+                fg=self.text_gray, bg=self.bg_dark).grid(row=0, column=0, padx=5)
+        
+        self.port_var = tk.StringVar()
+        self.port_combo = ttk.Combobox(port_frame, textvariable=self.port_var, 
+                                       width=18, state='readonly')
+        self.port_combo.grid(row=0, column=1, padx=5)
+        self.refresh_ports()
+        
+        btn_frame = tk.Frame(conn_panel, bg=self.bg_dark)
+        btn_frame.pack(padx=15, pady=(0, 10))
+        
+        refresh_btn = tk.Button(btn_frame, text="⟳ REFRESH", 
+                               command=self.refresh_ports,
+                               bg=self.bg_card, fg=self.accent_cyan,
+                               font=("Arial", 9, "bold"),
+                               relief=tk.FLAT, cursor='hand2', padx=10)
+        refresh_btn.pack(side=tk.LEFT, padx=3)
+        
+        self.connect_btn = tk.Button(btn_frame, text="● CONNECT",
+                                     command=self.toggle_connection,
+                                     bg=self.accent_pink, fg=self.text_white,
+                                     font=("Arial", 10, "bold"),
+                                     relief=tk.FLAT, cursor='hand2', padx=15, pady=5)
+        self.connect_btn.pack(side=tk.LEFT, padx=3)
+        
+        # ============ SPEEDOMETER ============
+        speed_frame = tk.Frame(self.root, bg=self.bg_dark)
+        speed_frame.pack(pady=15)
+        
+        self.speed_canvas = tk.Canvas(speed_frame, width=220, height=220,
+                                      bg=self.bg_card, highlightthickness=0)
+        self.speed_canvas.pack()
+        
+        # Draw speedometer rings
+        self.speed_canvas.create_oval(10, 10, 210, 210, 
+                                      outline=self.accent_pink, width=4)
+        self.speed_canvas.create_oval(25, 25, 195, 195, 
+                                      outline=self.accent_pink, width=1)
+        
+        self.speed_arc = self.speed_canvas.create_arc(15, 15, 205, 205,
+                                                      start=90, extent=0,
+                                                      outline=self.accent_cyan,
+                                                      width=10, style=tk.ARC)
+        
+        self.speed_text = self.speed_canvas.create_text(110, 95,
+                                                        text="0",
+                                                        font=("Arial Black", 52, "bold"),
+                                                        fill=self.text_white)
+        
+        self.speed_canvas.create_text(110, 140, text="POWER %",
+                                      font=("Arial", 11, "bold"),
+                                      fill=self.accent_cyan)
+        
+        # ============ MOTOR STATUS ============
+        motor_container = tk.Frame(self.root, bg=self.bg_dark)
+        motor_container.pack(fill=tk.X, padx=20, pady=10)
+        
+        # Left motor
+        left_motor = tk.Frame(motor_container, bg=self.bg_card, relief=tk.RAISED, bd=2)
+        left_motor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        
+        tk.Label(left_motor, text="◀ LEFT MOTOR", 
+                font=("Arial", 11, "bold"),
+                fg=self.accent_cyan, bg=self.bg_card).pack(pady=8)
+        
+        self.left_bar = tk.Canvas(left_motor, height=35, bg=self.bg_dark,
+                                 highlightthickness=0)
+        self.left_bar.pack(fill=tk.X, padx=12, pady=8)
+        
+        self.left_text = tk.Label(left_motor, text="0",
+                                 font=("Courier New", 16, "bold"),
+                                 fg=self.text_white, bg=self.bg_card)
+        self.left_text.pack(pady=8)
+        
+        # Right motor
+        right_motor = tk.Frame(motor_container, bg=self.bg_card, relief=tk.RAISED, bd=2)
+        right_motor.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=8)
+        
+        tk.Label(right_motor, text="RIGHT MOTOR ▶", 
+                font=("Arial", 11, "bold"),
+                fg=self.accent_cyan, bg=self.bg_card).pack(pady=8)
+        
+        self.right_bar = tk.Canvas(right_motor, height=35, bg=self.bg_dark,
+                                  highlightthickness=0)
+        self.right_bar.pack(fill=tk.X, padx=12, pady=8)
+        
+        self.right_text = tk.Label(right_motor, text="0",
+                                  font=("Courier New", 16, "bold"),
+                                  fg=self.text_white, bg=self.bg_card)
+        self.right_text.pack(pady=8)
+        
+        # ============ CONTROLS ============
+        controls_container = tk.Frame(self.root, bg=self.bg_dark)
+        controls_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Throttle (Left)
+        throttle_col = tk.Frame(controls_container, bg=self.bg_dark)
+        throttle_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        
+        tk.Label(throttle_col, text="⚡ THROTTLE", 
+                font=("Arial", 12, "bold"),
+                fg=self.accent_green, bg=self.bg_dark).pack(pady=5)
+        
+        self.throttle_canvas = tk.Canvas(throttle_col, width=110, height=220,
+                                         bg=self.bg_card, cursor='hand2',
+                                         highlightthickness=3,
+                                         highlightbackground=self.accent_green)
+        self.throttle_canvas.pack()
+        self.throttle_canvas.bind('<Button-1>', self.throttle_press)
+        self.throttle_canvas.bind('<B1-Motion>', self.throttle_drag)
+        self.throttle_canvas.bind('<ButtonRelease-1>', self.throttle_release)
+        
+        # Steering (Center)
+        steering_col = tk.Frame(controls_container, bg=self.bg_dark)
+        steering_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        
+        tk.Label(steering_col, text="◀ STEERING ▶", 
+                font=("Arial", 12, "bold"),
+                fg=self.accent_pink, bg=self.bg_dark).pack(pady=5)
+        
+        self.steering_canvas = tk.Canvas(steering_col, width=220, height=90,
+                                         bg=self.bg_card, cursor='hand2',
+                                         highlightthickness=3,
+                                         highlightbackground=self.accent_pink)
+        self.steering_canvas.pack(pady=50)
+        
+        self.steering_canvas.create_text(25, 45, text="L",
+                                         font=("Arial Black", 24, "bold"),
+                                         fill=self.accent_pink)
+        self.steering_canvas.create_text(195, 45, text="R",
+                                         font=("Arial Black", 24, "bold"),
+                                         fill=self.accent_pink)
+        
+        self.steering_indicator = self.steering_canvas.create_rectangle(
+            105, 15, 115, 75, fill=self.accent_pink, outline='')
+        
+        self.steering_canvas.bind('<Button-1>', self.steering_press)
+        self.steering_canvas.bind('<B1-Motion>', self.steering_drag)
+        self.steering_canvas.bind('<ButtonRelease-1>', self.steering_release)
+        
+        self.steering_text = tk.Label(steering_col, text="CENTER",
+                                     font=("Arial", 14, "bold"),
+                                     fg=self.text_white, bg=self.bg_dark)
+        self.steering_text.pack(pady=8)
+        
+        # Differential drive explanation
+        drive_hint = tk.Label(steering_col, 
+                            text="Tank Controls: Wheels spin at different speeds to turn",
+                            font=("Arial", 8),
+                            fg=self.text_gray, bg=self.bg_dark)
+        drive_hint.pack()
+        
+        # Brake (Right)
+        brake_col = tk.Frame(controls_container, bg=self.bg_dark)
+        brake_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=8)
+        
+        tk.Label(brake_col, text="◼ BRAKE", 
+                font=("Arial", 12, "bold"),
+                fg=self.accent_red, bg=self.bg_dark).pack(pady=5)
+        
+        self.brake_canvas = tk.Canvas(brake_col, width=110, height=220,
+                                      bg=self.bg_card, cursor='hand2',
+                                      highlightthickness=3,
+                                      highlightbackground=self.accent_red)
+        self.brake_canvas.pack()
+        self.brake_canvas.bind('<Button-1>', self.brake_press)
+        self.brake_canvas.bind('<B1-Motion>', self.brake_drag)
+        self.brake_canvas.bind('<ButtonRelease-1>', self.brake_release)
+        
+        # ============ STATUS BAR ============
+        self.status_bar = tk.Label(self.root, text="● DISCONNECTED",
+                                   font=("Arial", 11, "bold"),
+                                   fg=self.accent_red, bg=self.bg_card,
+                                   pady=12)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+    
+    def refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo['values'] = ports
+        if ports:
+            self.port_combo.current(0)
+        
+        # Auto-detect Arduino
+        auto_port = self.controller.find_arduino()
+        if auto_port and auto_port in ports:
+            self.port_combo.set(auto_port)
+    
+    def toggle_connection(self):
+        if not self.controller.connected:
+            port = self.port_var.get()
+            if not port:
+                messagebox.showerror("Error", "Select a port first")
+                return
+            
+            if self.controller.connect(port):
+                self.connect_btn.config(text="● DISCONNECT", bg=self.accent_green)
+                self.status_bar.config(text="● CONNECTED", fg=self.accent_green)
+                self.port_combo.config(state='disabled')
+            else:
+                messagebox.showerror("Error", "Connection failed")
+        else:
+            self.controller.disconnect()
+            self.connect_btn.config(text="● CONNECT", bg=self.accent_pink)
+            self.status_bar.config(text="● DISCONNECTED", fg=self.accent_red)
+            self.port_combo.config(state='readonly')
+    
+    # Throttle handlers
+    def throttle_press(self, e):
+        self.throttle_active = True
+        self.update_throttle(e.y)
+    
+    def throttle_drag(self, e):
+        if self.throttle_active:
+            self.update_throttle(e.y)
+    
+    def throttle_release(self, e):
+        self.throttle_active = False
+        self.controller.throttle = 0.0
+    
+    def update_throttle(self, y):
+        h = self.throttle_canvas.winfo_height()
+        val = max(0, min(1, 1 - (y / h)))
+        self.controller.throttle = val
+        
+        self.throttle_canvas.delete('bar')
+        bar_h = val * h
+        self.throttle_canvas.create_rectangle(0, h - bar_h, 110, h,
+                                              fill=self.accent_green, tags='bar')
+    
+    # Brake handlers
+    def brake_press(self, e):
+        self.brake_active = True
+        self.update_brake(e.y)
+    
+    def brake_drag(self, e):
+        if self.brake_active:
+            self.update_brake(e.y)
+    
+    def brake_release(self, e):
+        self.brake_active = False
+        self.controller.brake = 0.0
+    
+    def update_brake(self, y):
+        h = self.brake_canvas.winfo_height()
+        val = max(0, min(1, 1 - (y / h)))
+        self.controller.brake = val
+        
+        self.brake_canvas.delete('bar')
+        bar_h = val * h
+        self.brake_canvas.create_rectangle(0, h - bar_h, 110, h,
+                                           fill=self.accent_red, tags='bar')
+    
+    # Steering handlers
+    def steering_press(self, e):
+        self.steering_active = True
+        self.update_steering(e.x)
+    
+    def steering_drag(self, e):
+        if self.steering_active:
+            self.update_steering(e.x)
+    
+    def steering_release(self, e):
+        self.steering_active = False
+        self.controller.steering = 0.0
+    
+    def update_steering(self, x):
+        w = self.steering_canvas.winfo_width()
+        val = max(-1, min(1, (x / w) * 2 - 1))
+        self.controller.steering = val
+        
+        indicator_x = (val + 1) / 2 * w
+        self.steering_canvas.coords(self.steering_indicator,
+                                    indicator_x - 5, 15,
+                                    indicator_x + 5, 75)
+        
+        if val < -0.1:
+            self.steering_text.config(text="◀◀ LEFT")
+        elif val > 0.1:
+            self.steering_text.config(text="RIGHT ▶▶")
+        else:
+            self.steering_text.config(text="CENTER")
+    
+    def update_motor_bar(self, canvas, speed):
+        canvas.delete('bar')
+        w = canvas.winfo_width()
+        bar_w = abs(speed) / 255 * w
+        canvas.create_rectangle(0, 0, bar_w, 35,
+                               fill=self.accent_cyan, tags='bar')
+    
+    def update_loop(self):
+        if self.controller.connected:
+            result = self.controller.update_motors()
+            if result[0] is not None:
+                left, right = result
+                
+                # Update speedometer
+                net = self.controller.throttle - self.controller.brake
+                speed_pct = int(abs(net) * 100)
+                self.speed_canvas.itemconfig(self.speed_text, text=str(speed_pct))
+                
+                extent = -speed_pct * 3.6
+                self.speed_canvas.itemconfig(self.speed_arc, extent=extent)
+                
+                # Update motors
+                self.update_motor_bar(self.left_bar, left)
+                self.left_text.config(text=str(left))
+                
+                self.update_motor_bar(self.right_bar, right)
+                self.right_text.config(text=str(right))
+        
+        self.root.after(50, self.update_loop)
+    
+    def on_closing(self):
+        self.controller.disconnect()
+        self.root.destroy()
+
+def main():
+    root = tk.Tk()
+    app = RacingUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
