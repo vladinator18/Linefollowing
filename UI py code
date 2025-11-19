@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-EROBOTA16 - ROG ALLY JOYSTICK CONTROL (FINAL V2)
-Fixes "One wheel moving" bug by adding Steering Sensitivity control.
-Includes live Invert toggles and Motor tuning.
+EROBOTA16 - ROG ALLY DUAL STICK CONTROL (FINAL V3)
+- Left Stick: Throttle (Forward/Back)
+- Right Stick: Steering (Left/Right)
+- Includes Axis Scanner to help map ROG Ally inputs.
 """
 
 import tkinter as tk
@@ -51,7 +52,7 @@ class RobotController:
         """Send L/R speeds to Arduino"""
         if self.ser and self.ser.is_open:
             try:
-                # Apply Inversions here
+                # Apply Inversions
                 l_final = -left if self.invert_left else left
                 r_final = -right if self.invert_right else right
                 
@@ -75,9 +76,13 @@ class JoystickHandler:
         self.joystick = None
         self.running = True
         
-        # Tuning Parameters
+        # Default Mappings (Standard XInput)
+        self.axis_speed = 1  # Left Stick Y
+        self.axis_turn = 2   # Right Stick X (Might need adjustment)
+        
+        # Tuning
         self.deadzone = 0.10
-        self.turn_sensitivity = 0.6 # Reduced default to prevent "one wheel stop"
+        self.turn_sensitivity = 0.7
         self.speed_limit = 1.0
         
         pygame.init()
@@ -86,50 +91,51 @@ class JoystickHandler:
         self.thread = threading.Thread(target=self.joystick_loop, daemon=True)
         self.thread.start()
     
-    def update_settings(self, turn_sens, speed_lim, deadzone):
+    def update_settings(self, turn_sens, speed_lim, deadzone, speed_axis, turn_axis):
         self.turn_sensitivity = turn_sens
         self.speed_limit = speed_lim
         self.deadzone = deadzone
+        try:
+            self.axis_speed = int(speed_axis)
+            self.axis_turn = int(turn_axis)
+        except:
+            pass
     
     def apply_deadzone(self, value):
-        if abs(value) < self.deadzone:
-            return 0.0
+        if abs(value) < self.deadzone: return 0.0
         sign = 1 if value > 0 else -1
         scaled = (abs(value) - self.deadzone) / (1.0 - self.deadzone)
         return sign * scaled
     
-    def calculate_motor_speeds(self, joystick_x, joystick_y):
-        # Invert Y-axis (up = forward)
-        throttle = -joystick_y
-        turn = joystick_x
+    def calculate_motor_speeds(self, speed_val, turn_val):
+        # Invert Speed Axis (Up is usually negative)
+        throttle = -speed_val
+        turn = turn_val
         
         # 1. Apply Deadzone
         throttle = self.apply_deadzone(throttle)
         turn = self.apply_deadzone(turn)
         
-        # 2. Apply Speed Limit
+        # 2. Apply Limits
         throttle *= self.speed_limit
-        
-        # 3. ARCADE MIXING
-        # Scale turn by sensitivity so it doesn't overpower throttle
-        # If sensitivity is 0.5, full turn only slows inner wheel by 50%, doesn't stop it.
         turn_input = turn * self.turn_sensitivity
         
+        # 3. DUAL STICK MIXING
         left_motor = throttle + turn_input
         right_motor = throttle - turn_input
         
-        # 4. Normalize (Keep ratio correct if > 1.0)
+        # 4. Normalize
         max_val = max(abs(left_motor), abs(right_motor))
         if max_val > 1.0:
             left_motor = left_motor / max_val
             right_motor = right_motor / max_val
         
-        # 5. Convert to PWM
+        # 5. PWM Conversion
         left_speed = int(left_motor * 255)
         right_speed = int(right_motor * 255)
         
         return left_speed, right_speed, throttle, turn
-    
+
     def joystick_loop(self):
         while self.running:
             try:
@@ -140,15 +146,28 @@ class JoystickHandler:
                     
                     pygame.event.pump()
                     
-                    # Read Left Stick
-                    x_axis = self.joystick.get_axis(0)
-                    y_axis = self.joystick.get_axis(1)
+                    # Get raw values for selected axes
+                    # Safety check if axis index exists
+                    num_axes = self.joystick.get_numaxes()
                     
-                    l_pwm, r_pwm, throttle, turn = self.calculate_motor_speeds(x_axis, y_axis)
-                    self.callback(l_pwm, r_pwm, x_axis, y_axis)
+                    raw_speed = 0.0
+                    if self.axis_speed < num_axes:
+                        raw_speed = self.joystick.get_axis(self.axis_speed)
+                        
+                    raw_turn = 0.0
+                    if self.axis_turn < num_axes:
+                        raw_turn = self.joystick.get_axis(self.axis_turn)
+                    
+                    # Get ALL axes for debug display
+                    all_axes = []
+                    for i in range(min(num_axes, 6)):
+                        all_axes.append(self.joystick.get_axis(i))
+
+                    l_pwm, r_pwm, th, tu = self.calculate_motor_speeds(raw_speed, raw_turn)
+                    self.callback(l_pwm, r_pwm, th, tu, all_axes)
                 else:
                     self.joystick = None
-                    self.callback(0, 0, 0, 0)
+                    self.callback(0, 0, 0, 0, [])
                 
                 time.sleep(0.02)
             except Exception as e:
@@ -161,8 +180,8 @@ class JoystickHandler:
 class RogAllyUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("EROBOTA16 - TUNING CONTROL")
-        self.root.geometry("1000x750")
+        self.root.title("EROBOTA16 - DUAL STICK CONTROL")
+        self.root.geometry("1000x800")
         self.root.configure(bg='#0d1117')
         
         self.controller = RobotController()
@@ -176,142 +195,129 @@ class RogAllyUI:
         self.text_white = '#ffffff'
         self.text_gray = '#8b949e'
         
-        self.joystick_x_raw = 0
-        self.joystick_y_raw = 0
         self.current_left = 0
         self.current_right = 0
+        self.raw_axes = []
         
         self.create_ui()
         self.joystick_handler = JoystickHandler(self.on_joystick_update)
         self.update_loop()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
-    def on_joystick_update(self, l_pwm, r_pwm, raw_x, raw_y):
+    def on_joystick_update(self, l_pwm, r_pwm, throttle, turn, all_axes):
         self.current_left = l_pwm
         self.current_right = r_pwm
-        self.joystick_x_raw = raw_x
-        self.joystick_y_raw = raw_y
+        self.raw_axes = all_axes
         self.controller.update_motors(l_pwm, r_pwm)
     
     def update_settings(self, _=None):
-        """Send slider values to joystick handler"""
         try:
-            turn = self.turn_scale.get()
-            speed = self.speed_scale.get()
+            t_sens = self.turn_scale.get()
+            s_lim = self.speed_scale.get()
             dead = self.dead_scale.get()
-            self.joystick_handler.update_settings(turn, speed, dead)
             
-            # Update Inverts
+            # Get Axis Mappings
+            s_axis = int(self.axis_speed_combo.get().split(" ")[0])
+            t_axis = int(self.axis_turn_combo.get().split(" ")[0])
+            
+            self.joystick_handler.update_settings(t_sens, s_lim, dead, s_axis, t_axis)
+            
             self.controller.invert_left = self.inv_left_var.get()
             self.controller.invert_right = self.inv_right_var.get()
         except:
             pass
 
     def create_ui(self):
-        # ============ HEADER ============
+        # HEADER
         header = tk.Frame(self.root, bg=self.bg_card, height=80)
         header.pack(fill=tk.X, padx=15, pady=15)
-        header.pack_propagate(False)
         
         title_frame = tk.Frame(header, bg=self.bg_card)
-        title_frame.pack(side=tk.LEFT, padx=20)
-        
-        tk.Label(title_frame, text="EROBOTA16", font=("Arial Black", 24), 
-                 fg=self.accent_red, bg=self.bg_card).pack(anchor='w')
-        tk.Label(title_frame, text="ROBOT TUNER", font=("Arial", 10, "bold"), 
-                 fg=self.accent_cyan, bg=self.bg_card).pack(anchor='w')
+        title_frame.pack(side=tk.LEFT, padx=20, pady=10)
+        tk.Label(title_frame, text="EROBOTA16", font=("Arial Black", 24), fg=self.accent_red, bg=self.bg_card).pack(anchor='w')
+        tk.Label(title_frame, text="DUAL STICK CONFIG", font=("Arial", 10, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor='w')
 
-        # Connection Controls
+        # Connection
         conn_frame = tk.Frame(header, bg=self.bg_card)
         conn_frame.pack(side=tk.RIGHT, padx=20)
-        
         self.port_combo = ttk.Combobox(conn_frame, width=15, state='readonly')
         self.port_combo.pack(side=tk.LEFT, padx=5)
-        
-        tk.Button(conn_frame, text="⟳", command=self.refresh_ports,
-                 bg=self.bg_card, fg=self.accent_cyan, relief=tk.FLAT).pack(side=tk.LEFT)
-                 
-        self.connect_btn = tk.Button(conn_frame, text="CONNECT", command=self.toggle_connection,
-                                   bg=self.accent_red, fg=self.text_white, font=("Arial", 10, "bold"))
+        tk.Button(conn_frame, text="⟳", command=self.refresh_ports, bg=self.bg_card, fg=self.accent_cyan).pack(side=tk.LEFT)
+        self.connect_btn = tk.Button(conn_frame, text="CONNECT", command=self.toggle_connection, bg=self.accent_red, fg=self.text_white)
         self.connect_btn.pack(side=tk.LEFT, padx=10)
         self.refresh_ports()
 
-        # ============ CONTENT ============
+        # CONTENT
         content = tk.Frame(self.root, bg=self.bg_dark)
         content.pack(fill=tk.BOTH, expand=True, padx=15)
 
-        # --- LEFT COL: VISUALS ---
-        left_col = tk.Frame(content, bg=self.bg_dark, width=400)
-        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # --- LEFT COLUMN: DEBUG & BARS ---
+        left_col = tk.Frame(content, bg=self.bg_dark)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
+
+        # Axis Scanner
+        scanner_frame = tk.LabelFrame(left_col, text="Joystick Axis Scanner (Find your Inputs)", 
+                                     bg=self.bg_dark, fg=self.accent_cyan, font=("Arial", 10, "bold"))
+        scanner_frame.pack(fill=tk.X, pady=10)
         
-        # Joystick Vis
-        tk.Label(left_col, text="INPUT VISUALIZER", font=("Arial", 12, "bold"),
-                fg=self.accent_cyan, bg=self.bg_dark).pack(pady=5)
-                
-        self.canvas = tk.Canvas(left_col, width=250, height=250, bg=self.bg_card,
-                              highlightthickness=2, highlightbackground=self.accent_cyan)
-        self.canvas.pack(pady=10)
-        self.canvas.create_oval(25, 25, 225, 225, outline=self.text_gray)
-        self.canvas.create_line(125, 25, 125, 225, fill=self.text_gray, dash=(4,4))
-        self.canvas.create_line(25, 125, 225, 125, fill=self.text_gray, dash=(4,4))
-        self.joy_dot = self.canvas.create_oval(115, 115, 135, 135, fill=self.accent_red, outline=self.text_white)
+        self.axis_labels = []
+        for i in range(6):
+            lbl = tk.Label(scanner_frame, text=f"Axis {i}: 0.00", bg=self.bg_dark, fg=self.text_gray, font=("Courier", 10))
+            lbl.pack(anchor='w', padx=10)
+            self.axis_labels.append(lbl)
 
         # Motor Bars
-        tk.Label(left_col, text="MOTOR OUTPUT", font=("Arial", 12, "bold"),
-                fg=self.accent_green, bg=self.bg_dark).pack(pady=(20,5))
-        
+        tk.Label(left_col, text="MOTOR OUTPUT", font=("Arial", 12, "bold"), fg=self.accent_green, bg=self.bg_dark).pack(pady=(20,5))
         self.l_bar = tk.Canvas(left_col, height=30, bg=self.bg_card, highlightthickness=0)
-        self.l_bar.pack(fill=tk.X, padx=40, pady=5)
-        self.l_lbl = tk.Label(left_col, text="L: 0", fg=self.text_white, bg=self.bg_dark)
-        self.l_lbl.pack()
-        
+        self.l_bar.pack(fill=tk.X, padx=10, pady=5)
         self.r_bar = tk.Canvas(left_col, height=30, bg=self.bg_card, highlightthickness=0)
-        self.r_bar.pack(fill=tk.X, padx=40, pady=5)
-        self.r_lbl = tk.Label(left_col, text="R: 0", fg=self.text_white, bg=self.bg_dark)
-        self.r_lbl.pack()
+        self.r_bar.pack(fill=tk.X, padx=10, pady=5)
 
-        # --- RIGHT COL: SETTINGS ---
-        right_col = tk.Frame(content, bg=self.bg_card, width=300)
+        # --- RIGHT COLUMN: CONFIGURATION ---
+        right_col = tk.Frame(content, bg=self.bg_card, width=350)
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=10, pady=10)
         right_col.pack_propagate(False)
         
-        tk.Label(right_col, text="⚙ SETTINGS", font=("Arial", 14, "bold"),
-                fg=self.text_white, bg=self.bg_card).pack(pady=15)
+        tk.Label(right_col, text="🎮 INPUT MAPPING", font=("Arial", 12, "bold"), fg=self.text_white, bg=self.bg_card).pack(pady=10)
 
-        # Sliders
-        def make_slider(parent, label, vmin, vmax, vdef, res):
-            frame = tk.Frame(parent, bg=self.bg_card)
-            frame.pack(fill=tk.X, padx=20, pady=10)
-            tk.Label(frame, text=label, fg=self.text_gray, bg=self.bg_card).pack(anchor='w')
-            s = tk.Scale(frame, from_=vmin, to=vmax, orient=tk.HORIZONTAL, 
-                        resolution=res, bg=self.bg_card, fg=self.text_white, 
-                        highlightthickness=0, command=self.update_settings)
+        # Axis Selectors
+        axis_opts = [f"{i} (Generic)" for i in range(6)]
+        
+        tk.Label(right_col, text="Speed Joystick Axis (Forward/Back)", fg=self.text_gray, bg=self.bg_card).pack(anchor='w', padx=20)
+        self.axis_speed_combo = ttk.Combobox(right_col, values=axis_opts, state='readonly')
+        self.axis_speed_combo.set("1 (Generic)") # Default Left Y
+        self.axis_speed_combo.pack(fill=tk.X, padx=20, pady=(0, 10))
+        self.axis_speed_combo.bind("<<ComboboxSelected>>", self.update_settings)
+
+        tk.Label(right_col, text="Turn Joystick Axis (Left/Right)", fg=self.text_gray, bg=self.bg_card).pack(anchor='w', padx=20)
+        self.axis_turn_combo = ttk.Combobox(right_col, values=axis_opts, state='readonly')
+        self.axis_turn_combo.set("2 (Generic)") # Default Right X
+        self.axis_turn_combo.pack(fill=tk.X, padx=20, pady=(0, 10))
+        self.axis_turn_combo.bind("<<ComboboxSelected>>", self.update_settings)
+
+        # Tuning
+        tk.Label(right_col, text="⚙ TUNING", font=("Arial", 12, "bold"), fg=self.text_white, bg=self.bg_card).pack(pady=10)
+
+        def make_slider(label, vmin, vmax, vdef, res):
+            f = tk.Frame(right_col, bg=self.bg_card)
+            f.pack(fill=tk.X, padx=20, pady=5)
+            tk.Label(f, text=label, fg=self.text_gray, bg=self.bg_card).pack(anchor='w')
+            s = tk.Scale(f, from_=vmin, to=vmax, orient=tk.HORIZONTAL, resolution=res, bg=self.bg_card, fg=self.text_white, highlightthickness=0, command=self.update_settings)
             s.set(vdef)
             s.pack(fill=tk.X)
             return s
 
-        self.turn_scale = make_slider(right_col, "Steering Sensitivity (Turn Rate)", 0.0, 1.0, 0.6, 0.05)
-        tk.Label(right_col, text="Lower this if one wheel stops when driving straight", 
-                fg='#555', bg=self.bg_card, font=("Arial", 8)).pack()
-        
-        self.speed_scale = make_slider(right_col, "Max Speed Limit", 0.1, 1.0, 1.0, 0.1)
-        self.dead_scale = make_slider(right_col, "Joystick Deadzone", 0.0, 0.3, 0.10, 0.01)
+        self.turn_scale = make_slider("Turning Sensitivity", 0.1, 1.0, 0.7, 0.05)
+        self.speed_scale = make_slider("Max Speed Limit", 0.1, 1.0, 1.0, 0.1)
+        self.dead_scale = make_slider("Deadzone", 0.0, 0.3, 0.1, 0.01)
 
-        # Toggles
-        tk.Label(right_col, text="Motor Direction", fg=self.text_gray, bg=self.bg_card).pack(pady=(20,5))
-        
+        # Invert Toggles
         self.inv_left_var = tk.BooleanVar()
-        tk.Checkbutton(right_col, text="Invert Left Motor", variable=self.inv_left_var,
-                      bg=self.bg_card, fg=self.accent_cyan, selectcolor=self.bg_dark,
-                      command=self.update_settings).pack(anchor='w', padx=30)
-                      
+        tk.Checkbutton(right_col, text="Invert Left Motor", variable=self.inv_left_var, bg=self.bg_card, fg=self.accent_cyan, selectcolor=self.bg_dark, command=self.update_settings).pack(anchor='w', padx=20, pady=5)
         self.inv_right_var = tk.BooleanVar()
-        tk.Checkbutton(right_col, text="Invert Right Motor", variable=self.inv_right_var,
-                      bg=self.bg_card, fg=self.accent_cyan, selectcolor=self.bg_dark,
-                      command=self.update_settings).pack(anchor='w', padx=30)
+        tk.Checkbutton(right_col, text="Invert Right Motor", variable=self.inv_right_var, bg=self.bg_card, fg=self.accent_cyan, selectcolor=self.bg_dark, command=self.update_settings).pack(anchor='w', padx=20, pady=5)
 
-        # Status
-        self.status_lbl = tk.Label(self.root, text="Ready", bg=self.accent_cyan, fg="#000")
+        self.status_lbl = tk.Label(self.root, text="Ready", bg=self.accent_cyan)
         self.status_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
     def refresh_ports(self):
@@ -327,7 +333,7 @@ class RogAllyUI:
                 self.connect_btn.config(text="DISCONNECT", bg=self.accent_green)
                 self.status_lbl.config(text="CONNECTED", bg=self.accent_green)
             else:
-                messagebox.showerror("Error", "Failed to connect")
+                messagebox.showerror("Error", "Failed")
         else:
             self.controller.disconnect()
             self.connect_btn.config(text="CONNECT", bg=self.accent_red)
@@ -344,18 +350,17 @@ class RogAllyUI:
         canvas.create_line(center, 0, center, 30, fill='white')
 
     def update_loop(self):
-        # Update Joy Dot
-        cx, cy = 125, 125
-        r = 100
-        x = cx + (self.joystick_x_raw * r)
-        y = cy + (self.joystick_y_raw * r)
-        self.canvas.coords(self.joy_dot, x-10, y-10, x+10, y+10)
-        
+        # Update Axis Debugger
+        for i, val in enumerate(self.raw_axes):
+            if i < len(self.axis_labels):
+                # Highlight active axes
+                bg = self.bg_card if abs(val) > 0.1 else self.bg_dark
+                fg = self.accent_green if abs(val) > 0.1 else self.text_gray
+                self.axis_labels[i].config(text=f"Axis {i}: {val:+.2f}", bg=bg, fg=fg)
+
         # Update Bars
         self.draw_bar(self.l_bar, self.current_left)
-        self.l_lbl.config(text=f"Left PWM: {self.current_left}")
         self.draw_bar(self.r_bar, self.current_right)
-        self.r_lbl.config(text=f"Right PWM: {self.current_right}")
         
         self.root.after(50, self.update_loop)
 
