@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-EROBOTA16 - ROG ALLY JOYSTICK CONTROL
-Uses ROG Ally's built-in joysticks for differential drive control
-Left stick for movement, visual feedback on screen
+EROBOTA16 - ROG ALLY JOYSTICK CONTROL (FINAL)
+Direct Drive Version: Sends L/R speeds directly to Arduino
+Includes "Snap-to-Center" for straight driving.
 """
 
 import tkinter as tk
@@ -17,13 +17,14 @@ class RobotController:
     def __init__(self):
         self.ser = None
         self.connected = False
-        self.base_speed = 0  # Forward/backward from Y-axis
-        self.turn_value = 0   # Left/right from X-axis
+        self.left_pwm = 0
+        self.right_pwm = 0
         
     def find_arduino(self):
         """Auto-detect Arduino port"""
         ports = serial.tools.list_ports.comports()
         for p in ports:
+            # Common descriptions for Arduino/Clones
             if any(x in p.description for x in ['Arduino', 'CH340', 'USB Serial', 'CP210']):
                 return p.device
         return None
@@ -33,7 +34,7 @@ class RobotController:
         try:
             self.ser = serial.Serial(port, baud, timeout=1)
             self.connected = True
-            time.sleep(2)
+            time.sleep(2) # Wait for Arduino reset
             return True
         except Exception as e:
             print(f"Error: {e}")
@@ -47,36 +48,34 @@ class RobotController:
             self.ser.close()
         self.connected = False
     
-    def send_command(self, speed, turn):
-        """Send command to Arduino"""
+    def send_command(self, left, right):
+        """Send direct L/R motor speeds to Arduino"""
         if self.ser and self.ser.is_open:
             try:
-                cmd = f"SPD:{speed};TURN:{turn}\n"
+                # Protocol: "L:-255;R:255\n"
+                cmd = f"L:{int(left)};R:{int(right)}\n"
                 self.ser.write(cmd.encode())
                 return True
             except:
                 return False
         return False
     
-    def update_motors(self):
-        """Send current joystick values to motors"""
-        if not self.connected:
-            return None, None
+    def update_motors(self, left, right):
+        """Update stored values and send to serial"""
+        self.left_pwm = left
+        self.right_pwm = right
         
-        self.send_command(self.base_speed, self.turn_value)
-        
-        # Calculate displayed wheel speeds
-        left_speed = max(-255, min(255, self.base_speed + self.turn_value))
-        right_speed = max(-255, min(255, self.base_speed - self.turn_value))
-        
-        return left_speed, right_speed
+        if self.connected:
+            self.send_command(self.left_pwm, self.right_pwm)
+            
+        return self.left_pwm, self.right_pwm
 
 class JoystickHandler:
     def __init__(self, callback):
         self.callback = callback
         self.joystick = None
         self.running = True
-        self.deadzone = 0.08  # Reduced deadzone (8% instead of 15%)
+        self.deadzone = 0.10  # 10% deadzone for stability
         
         pygame.init()
         pygame.joystick.init()
@@ -95,31 +94,33 @@ class JoystickHandler:
     
     def calculate_motor_speeds(self, joystick_x, joystick_y):
         """
-        Proper Differential Drive Algorithm with Normalization
-        Prevents over-saturation while maintaining steering ratio
+        Proper Differential Drive Algorithm
         """
         # Invert Y-axis (up = forward)
         throttle = -joystick_y
         turn = joystick_x
         
-        # Apply deadzone to both axes
+        # 1. Apply Deadzone
         throttle = self.apply_deadzone(throttle, self.deadzone)
         turn = self.apply_deadzone(turn, self.deadzone)
         
-        # Calculate raw motor mix (Arcade Drive)
+        # 2. SNAP TO CENTER (Fixes drift when trying to go straight)
+        # If throttle is significant (>30%) but turn is small (<15%), force turn to 0
+        if abs(throttle) > 0.3 and abs(turn) < 0.15:
+            turn = 0.0
+        
+        # 3. Arcade Drive Mixing
         left_motor = throttle + turn
         right_motor = throttle - turn
         
-        # Find maximum absolute value
+        # 4. Normalization
+        # If inputs combine to > 1.0, scale both down to keep the turn ratio
         max_val = max(abs(left_motor), abs(right_motor))
-        
-        # Normalize if we exceeded 1.0 (prevent over-saturation)
-        # This keeps the ratio correct while staying within limits
         if max_val > 1.0:
             left_motor = left_motor / max_val
             right_motor = right_motor / max_val
         
-        # Convert to PWM range (-255 to +255)
+        # 5. Convert to PWM range (-255 to +255)
         left_speed = int(left_motor * 255)
         right_speed = int(right_motor * 255)
         
@@ -142,11 +143,11 @@ class JoystickHandler:
                     x_axis = self.joystick.get_axis(0)
                     y_axis = self.joystick.get_axis(1)
                     
-                    # Calculate motor speeds using proper differential drive
-                    left_speed, right_speed, throttle, turn = self.calculate_motor_speeds(x_axis, y_axis)
+                    # Calculate actual motor PWMs here
+                    l_pwm, r_pwm, throttle, turn = self.calculate_motor_speeds(x_axis, y_axis)
                     
-                    # Send to callback
-                    self.callback(left_speed, right_speed, turn, throttle)
+                    # Send calculated PWMs to main thread
+                    self.callback(l_pwm, r_pwm, x_axis, y_axis)
                     
                 else:
                     if self.joystick is not None:
@@ -166,14 +167,14 @@ class JoystickHandler:
 class RogAllyUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("EROBOTA16 - LEFT STICK CONTROL")
+        self.root.title("EROBOTA16 - DIRECT CONTROL")
         self.root.geometry("900x700")
         self.root.configure(bg='#0d1117')
         self.root.resizable(False, False)
         
         self.controller = RobotController()
         
-        # ROG Ally color scheme
+        # Colors
         self.bg_dark = '#0d1117'
         self.bg_card = '#161b22'
         self.accent_red = '#ff0a54'
@@ -183,8 +184,11 @@ class RogAllyUI:
         self.text_white = '#ffffff'
         self.text_gray = '#8b949e'
         
-        self.joystick_x = 0
-        self.joystick_y = 0
+        # Data storage
+        self.joystick_x_raw = 0
+        self.joystick_y_raw = 0
+        self.current_left = 0
+        self.current_right = 0
         
         self.create_ui()
         
@@ -194,12 +198,20 @@ class RogAllyUI:
         self.update_loop()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
-    def on_joystick_update(self, base_speed, turn_value, x_axis, y_axis):
-        """Called when joystick values change"""
-        self.controller.base_speed = base_speed
-        self.controller.turn_value = turn_value
-        self.joystick_x = x_axis
-        self.joystick_y = y_axis
+    def on_joystick_update(self, l_pwm, r_pwm, raw_x, raw_y):
+        """
+        Called from thread when joystick moves.
+        Args:
+            l_pwm, r_pwm: Calculated motor speeds (-255 to 255)
+            raw_x, raw_y: Raw joystick axis values for visualization
+        """
+        self.current_left = l_pwm
+        self.current_right = r_pwm
+        self.joystick_x_raw = raw_x
+        self.joystick_y_raw = raw_y
+        
+        # Send to Arduino immediately
+        self.controller.update_motors(l_pwm, r_pwm)
     
     def create_ui(self):
         # ============ HEADER ============
@@ -216,12 +228,12 @@ class RogAllyUI:
                         fg=self.accent_red, bg=self.bg_card)
         title.pack(anchor='w')
         
-        subtitle = tk.Label(title_frame, text="LEFT STICK ONLY CONTROL", 
+        subtitle = tk.Label(title_frame, text="DIRECT DRIVE CONTROL", 
                            font=("Arial", 11, "bold"),
                            fg=self.accent_cyan, bg=self.bg_card)
         subtitle.pack(anchor='w')
         
-        drive_info = tk.Label(title_frame, text="Tank Drive • Full Control with One Joystick", 
+        drive_info = tk.Label(title_frame, text="Snap-to-Center Enabled • Differential Mixing", 
                             font=("Arial", 8),
                             fg=self.text_gray, bg=self.bg_card)
         drive_info.pack(anchor='w')
@@ -267,11 +279,10 @@ class RogAllyUI:
         left_panel = tk.Frame(main_container, bg=self.bg_dark)
         left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
         
-        tk.Label(left_panel, text="🎮 LEFT STICK", 
+        tk.Label(left_panel, text="🎮 INPUT", 
                 font=("Arial", 16, "bold"),
                 fg=self.accent_cyan, bg=self.bg_dark).pack(pady=10)
         
-        # Joystick visualization canvas
         self.joystick_canvas = tk.Canvas(left_panel, width=300, height=300,
                                          bg=self.bg_card, highlightthickness=3,
                                          highlightbackground=self.accent_cyan)
@@ -283,27 +294,17 @@ class RogAllyUI:
         self.joystick_canvas.create_oval(40, 40, 260, 260, 
                                          outline=self.accent_cyan, width=1)
         
-        # Draw crosshair
+        # Crosshair
         self.joystick_canvas.create_line(150, 30, 150, 270, 
                                          fill=self.text_gray, width=1, dash=(5, 5))
         self.joystick_canvas.create_line(30, 150, 270, 150, 
                                          fill=self.text_gray, width=1, dash=(5, 5))
         
-        # Joystick indicator (will be updated)
+        # Joystick indicator
         self.joystick_indicator = self.joystick_canvas.create_oval(
             135, 135, 165, 165,
             fill=self.accent_red, outline=self.text_white, width=2
         )
-        
-        # Direction labels
-        self.joystick_canvas.create_text(150, 15, text="FORWARD", 
-                                         font=("Arial", 9, "bold"), fill=self.text_gray)
-        self.joystick_canvas.create_text(150, 285, text="REVERSE", 
-                                         font=("Arial", 9, "bold"), fill=self.text_gray)
-        self.joystick_canvas.create_text(15, 150, text="L", 
-                                         font=("Arial", 12, "bold"), fill=self.text_gray)
-        self.joystick_canvas.create_text(285, 150, text="R", 
-                                         font=("Arial", 12, "bold"), fill=self.text_gray)
         
         # Joystick values display
         values_frame = tk.Frame(left_panel, bg=self.bg_card)
@@ -314,88 +315,43 @@ class RogAllyUI:
                                    fg=self.accent_orange, bg=self.bg_card, pady=10)
         self.joy_status.pack()
         
-        # Right side - Motor status and speedometer
+        # Right side - Motor output
         right_panel = tk.Frame(main_container, bg=self.bg_dark)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10)
         
-        # Speedometer
-        tk.Label(right_panel, text="⚡ POWER", 
+        tk.Label(right_panel, text="⚡ MOTOR OUTPUT", 
                 font=("Arial", 16, "bold"),
                 fg=self.accent_green, bg=self.bg_dark).pack(pady=10)
         
-        self.speed_canvas = tk.Canvas(right_panel, width=220, height=220,
-                                      bg=self.bg_card, highlightthickness=0)
-        self.speed_canvas.pack(pady=10)
-        
-        # Draw speedometer
-        self.speed_canvas.create_oval(10, 10, 210, 210, 
-                                      outline=self.accent_red, width=4)
-        self.speed_canvas.create_oval(25, 25, 195, 195, 
-                                      outline=self.accent_red, width=1)
-        
-        self.speed_arc = self.speed_canvas.create_arc(15, 15, 205, 205,
-                                                      start=90, extent=0,
-                                                      outline=self.accent_green,
-                                                      width=10, style=tk.ARC)
-        
-        self.speed_text = self.speed_canvas.create_text(110, 95,
-                                                        text="0",
-                                                        font=("Arial Black", 52, "bold"),
-                                                        fill=self.text_white)
-        
-        self.speed_canvas.create_text(110, 140, text="POWER %",
-                                      font=("Arial", 11, "bold"),
-                                      fill=self.accent_cyan)
-        
-        # Motor status
+        # Motor bars container
         motor_frame = tk.Frame(right_panel, bg=self.bg_dark)
         motor_frame.pack(pady=20, fill=tk.X)
         
-        # Left motor
-        left_motor = tk.Frame(motor_frame, bg=self.bg_card, relief=tk.RAISED, bd=2)
-        left_motor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        # Left Motor Bar
+        left_motor_frame = tk.Frame(motor_frame, bg=self.bg_card, relief=tk.RAISED, bd=2)
+        left_motor_frame.pack(pady=10, fill=tk.X, padx=5)
         
-        tk.Label(left_motor, text="◀ LEFT", 
-                font=("Arial", 10, "bold"),
+        tk.Label(left_motor_frame, text="LEFT MOTOR", font=("Arial", 10, "bold"),
                 fg=self.accent_cyan, bg=self.bg_card).pack(pady=5)
-        
-        self.left_bar = tk.Canvas(left_motor, height=30, bg=self.bg_dark,
-                                 highlightthickness=0)
+                
+        self.left_bar = tk.Canvas(left_motor_frame, height=40, bg=self.bg_dark, highlightthickness=0)
         self.left_bar.pack(fill=tk.X, padx=10, pady=5)
-        
-        self.left_text = tk.Label(left_motor, text="0",
-                                 font=("Courier New", 14, "bold"),
+        self.left_text = tk.Label(left_motor_frame, text="0", font=("Courier New", 14, "bold"),
                                  fg=self.text_white, bg=self.bg_card)
         self.left_text.pack(pady=5)
+
+        # Right Motor Bar
+        right_motor_frame = tk.Frame(motor_frame, bg=self.bg_card, relief=tk.RAISED, bd=2)
+        right_motor_frame.pack(pady=10, fill=tk.X, padx=5)
         
-        # Right motor
-        right_motor = tk.Frame(motor_frame, bg=self.bg_card, relief=tk.RAISED, bd=2)
-        right_motor.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
-        
-        tk.Label(right_motor, text="RIGHT ▶", 
-                font=("Arial", 10, "bold"),
+        tk.Label(right_motor_frame, text="RIGHT MOTOR", font=("Arial", 10, "bold"),
                 fg=self.accent_cyan, bg=self.bg_card).pack(pady=5)
-        
-        self.right_bar = tk.Canvas(right_motor, height=30, bg=self.bg_dark,
-                                  highlightthickness=0)
+                
+        self.right_bar = tk.Canvas(right_motor_frame, height=40, bg=self.bg_dark, highlightthickness=0)
         self.right_bar.pack(fill=tk.X, padx=10, pady=5)
-        
-        self.right_text = tk.Label(right_motor, text="0",
-                                  font=("Courier New", 14, "bold"),
+        self.right_text = tk.Label(right_motor_frame, text="0", font=("Courier New", 14, "bold"),
                                   fg=self.text_white, bg=self.bg_card)
         self.right_text.pack(pady=5)
-        
-        # Instructions
-        instructions = tk.Frame(self.root, bg=self.bg_card, relief=tk.RAISED, bd=2)
-        instructions.pack(fill=tk.X, padx=20, pady=10)
-        
-        inst_text = """🎮 LEFT JOYSTICK ONLY CONTROL
-        ⬆ UP = Forward • ⬇ DOWN = Reverse • ⬅ LEFT = Turn Left • ➡ RIGHT = Turn Right
-        ↖↗ DIAGONALS = Move + Turn • ⊙ CENTER = Stop"""
-        
-        tk.Label(instructions, text=inst_text,
-                font=("Arial", 10, "bold"),
-                fg=self.text_white, bg=self.bg_card, pady=15).pack()
         
         # Status bar
         self.status_bar = tk.Label(self.root, text="● DISCONNECTED",
@@ -422,7 +378,7 @@ class RogAllyUI:
             
             if self.controller.connect(port):
                 self.connect_btn.config(text="● DISCONNECT", bg=self.accent_green)
-                self.status_bar.config(text="● CONNECTED - Ready to drive!", 
+                self.status_bar.config(text="● CONNECTED - Driving Active", 
                                       fg=self.accent_green)
                 self.port_combo.config(state='disabled')
             else:
@@ -433,54 +389,54 @@ class RogAllyUI:
             self.status_bar.config(text="● DISCONNECTED", fg=self.accent_red)
             self.port_combo.config(state='readonly')
     
-    def update_motor_bar(self, canvas, speed):
+    def draw_bi_directional_bar(self, canvas, speed):
+        """Draws a bar from the center outwards"""
         canvas.delete('bar')
         w = canvas.winfo_width()
-        bar_w = abs(speed) / 255 * w
+        h = canvas.winfo_height()
+        center = w / 2
+        
+        # Speed is -255 to 255
+        # Normalize to -1.0 to 1.0
+        norm_speed = speed / 255.0
+        bar_length = norm_speed * (w / 2)
+        
         color = self.accent_green if speed >= 0 else self.accent_orange
-        canvas.create_rectangle(0, 0, bar_w, 30, fill=color, tags='bar')
-    
+        
+        # Draw from center
+        canvas.create_rectangle(center, 0, center + bar_length, h, fill=color, tags='bar')
+        # Center line marker
+        canvas.create_line(center, 0, center, h, fill=self.text_white, width=2)
+
     def update_loop(self):
-        # Update joystick visualization
+        # 1. Update Joystick Visuals
         center_x = 150
         center_y = 150
         radius = 110
         
-        pos_x = center_x + (self.joystick_x * radius)
-        pos_y = center_y + (self.joystick_y * radius)
+        pos_x = center_x + (self.joystick_x_raw * radius)
+        pos_y = center_y + (self.joystick_y_raw * radius)
         
         self.joystick_canvas.coords(self.joystick_indicator,
                                     pos_x - 15, pos_y - 15,
                                     pos_x + 15, pos_y + 15)
         
-        # Update joystick status
+        # 2. Update Text Status
         if pygame.joystick.get_count() > 0:
             joy_name = pygame.joystick.Joystick(0).get_name()
-            status_text = f"🎮 {joy_name}\nX: {self.joystick_x:+.2f} | Y: {self.joystick_y:+.2f}"
+            # Show the calculated PWM outputs in the status
+            status_text = f"🎮 {joy_name}\nRAW X:{self.joystick_x_raw:.2f} Y:{self.joystick_y_raw:.2f}"
             self.joy_status.config(text=status_text, fg=self.accent_green)
         else:
-            self.joy_status.config(text="⚠ No joystick detected\nConnect ROG Ally controller", 
+            self.joy_status.config(text="⚠ No joystick detected", 
                                   fg=self.accent_orange)
         
-        # Update motors
-        if self.controller.connected:
-            result = self.controller.update_motors()
-            if result[0] is not None:
-                left, right = result
-                
-                # Update speedometer
-                speed_pct = int(abs(self.controller.base_speed) / 255 * 100)
-                self.speed_canvas.itemconfig(self.speed_text, text=str(speed_pct))
-                
-                extent = -speed_pct * 3.6
-                self.speed_canvas.itemconfig(self.speed_arc, extent=extent)
-                
-                # Update motor bars
-                self.update_motor_bar(self.left_bar, left)
-                self.left_text.config(text=str(left))
-                
-                self.update_motor_bar(self.right_bar, right)
-                self.right_text.config(text=str(right))
+        # 3. Update Motor Visuals (Center-Zero Bars)
+        self.draw_bi_directional_bar(self.left_bar, self.current_left)
+        self.left_text.config(text=f"{self.current_left}")
+        
+        self.draw_bi_directional_bar(self.right_bar, self.current_right)
+        self.right_text.config(text=f"{self.current_right}")
         
         self.root.after(50, self.update_loop)
     
