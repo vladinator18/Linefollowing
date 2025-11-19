@@ -76,13 +76,54 @@ class JoystickHandler:
         self.callback = callback
         self.joystick = None
         self.running = True
-        self.deadzone = 0.15  # Ignore small movements
+        self.deadzone = 0.08  # Reduced deadzone (8% instead of 15%)
         
         pygame.init()
         pygame.joystick.init()
         
         self.thread = threading.Thread(target=self.joystick_loop, daemon=True)
         self.thread.start()
+    
+    def apply_deadzone(self, value, deadzone):
+        """Apply deadzone with smooth scaling"""
+        if abs(value) < deadzone:
+            return 0.0
+        # Scale the remaining range to 0-1
+        sign = 1 if value > 0 else -1
+        scaled = (abs(value) - deadzone) / (1.0 - deadzone)
+        return sign * scaled
+    
+    def calculate_motor_speeds(self, joystick_x, joystick_y):
+        """
+        Proper Differential Drive Algorithm with Normalization
+        Prevents over-saturation while maintaining steering ratio
+        """
+        # Invert Y-axis (up = forward)
+        throttle = -joystick_y
+        turn = joystick_x
+        
+        # Apply deadzone to both axes
+        throttle = self.apply_deadzone(throttle, self.deadzone)
+        turn = self.apply_deadzone(turn, self.deadzone)
+        
+        # Calculate raw motor mix (Arcade Drive)
+        left_motor = throttle + turn
+        right_motor = throttle - turn
+        
+        # Find maximum absolute value
+        max_val = max(abs(left_motor), abs(right_motor))
+        
+        # Normalize if we exceeded 1.0 (prevent over-saturation)
+        # This keeps the ratio correct while staying within limits
+        if max_val > 1.0:
+            left_motor = left_motor / max_val
+            right_motor = right_motor / max_val
+        
+        # Convert to PWM range (-255 to +255)
+        left_speed = int(left_motor * 255)
+        right_speed = int(right_motor * 255)
+        
+        return left_speed, right_speed, throttle, turn
     
     def joystick_loop(self):
         """Background thread to read joystick input"""
@@ -97,27 +138,15 @@ class JoystickHandler:
                     
                     pygame.event.pump()
                     
-                    # Read left stick (stick 0)
-                    # X-axis: -1 (left) to +1 (right)
-                    # Y-axis: -1 (up) to +1 (down)
+                    # Read left stick (axis 0 = X, axis 1 = Y)
                     x_axis = self.joystick.get_axis(0)
                     y_axis = self.joystick.get_axis(1)
                     
-                    # Apply deadzone
-                    if abs(x_axis) < self.deadzone:
-                        x_axis = 0
-                    if abs(y_axis) < self.deadzone:
-                        y_axis = 0
-                    
-                    # Convert to robot commands
-                    # Y-axis controls speed (inverted: up = forward)
-                    base_speed = int(-y_axis * 255)
-                    
-                    # X-axis controls turning
-                    turn_value = int(x_axis * 120)
+                    # Calculate motor speeds using proper differential drive
+                    left_speed, right_speed, throttle, turn = self.calculate_motor_speeds(x_axis, y_axis)
                     
                     # Send to callback
-                    self.callback(base_speed, turn_value, x_axis, y_axis)
+                    self.callback(left_speed, right_speed, turn, throttle)
                     
                 else:
                     if self.joystick is not None:
@@ -137,7 +166,7 @@ class JoystickHandler:
 class RogAllyUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("EROBOTA16 - ROG ALLY CONTROL")
+        self.root.title("EROBOTA16 - LEFT STICK CONTROL")
         self.root.geometry("900x700")
         self.root.configure(bg='#0d1117')
         self.root.resizable(False, False)
