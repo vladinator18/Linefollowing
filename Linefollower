@@ -1,0 +1,181 @@
+// ================================================================
+// Line Follower Robot - Optimized PID Control
+// Hardware: EROBOTA16 Firmware V4 Configuration
+// ================================================================
+
+// ----------------------------
+// Pin Definitions (EROBOTA16)
+// ----------------------------
+#define PWMA 2
+#define AIN2 3
+#define AIN1 4
+#define STBY 5
+#define BIN1 6
+#define BIN2 7
+#define PWMB 8
+
+// ----------------------------
+// Tuning Parameters
+// ----------------------------
+const int threshold = 800;      // Sensor threshold (Adjust based on environment)
+const int base_speed = 180;     // Normal cruising speed (0-255)
+const int max_speed = 255;      // Maximum speed cap
+const int turn_speed = 150;     // Speed for sharp turns when line is lost
+
+// PID Constants (Adjust these to smooth out the wobble)
+float Kp = 40;   // Proportional (Reaction to current error)
+float Kd = 300;  // Derivative (Dampening/Prediction)
+
+// ----------------------------
+// Global Variables
+// ----------------------------
+int sensors[5];                 // Sensor readings (0 or 1)
+int weights[5] = {-2, -1, 0, 1, 2}; // Position weights (0 is center)
+float error = 0;
+float previous_error = 0;
+int last_turn_direction = 0;    // -1 = Left, 1 = Right, 0 = Straight
+
+void setup() {
+  // Motor Control Pins
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  // Enable Motor Driver
+  digitalWrite(STBY, HIGH);
+
+  // Sensor Pins (A0 to A4)
+  for (int i = 0; i < 5; i++) {
+    pinMode(A0 + i, INPUT);
+  }
+
+  Serial.begin(9600);
+  delay(1000); // Brief pause before starting
+}
+
+void loop() {
+  int active_sensors = read_sensors();
+
+  // ----------------------------
+  // CASE 1: Line Detected (Normal PID Control)
+  // ----------------------------
+  if (active_sensors > 0 && active_sensors < 5) {
+    
+    // Calculate PID Output
+    float P = error;
+    float D = error - previous_error;
+    float PID_value = (Kp * P) + (Kd * D);
+
+    previous_error = error;
+
+    // Determine Motor Speeds
+    // If error is positive (line is to the right), turn right (Left Motor +, Right Motor -)
+    int left_motor_speed = base_speed + PID_value;
+    int right_motor_speed = base_speed - PID_value;
+
+    // Constrain speeds
+    left_motor_speed = constrain(left_motor_speed, -max_speed, max_speed);
+    right_motor_speed = constrain(right_motor_speed, -max_speed, max_speed);
+
+    set_motors(left_motor_speed, right_motor_speed);
+
+    // Remember direction for recovery
+    if (error > 0) last_turn_direction = 1;
+    else if (error < 0) last_turn_direction = -1;
+    else last_turn_direction = 0;
+  }
+
+  // ----------------------------
+  // CASE 2: No Line (Recovery Mode)
+  // ----------------------------
+  else if (active_sensors == 0) {
+    // Robot has lost the line. Spin in the direction of the last known error.
+    if (last_turn_direction == 1) {
+      // Last known line was to the right -> Spin Right
+      set_motors(turn_speed, -turn_speed);
+    } 
+    else if (last_turn_direction == -1) {
+      // Last known line was to the left -> Spin Left
+      set_motors(-turn_speed, turn_speed);
+    }
+  }
+
+  // ----------------------------
+  // CASE 3: All Sensors Black (Intersection/Stop)
+  // ----------------------------
+  else if (active_sensors == 5) {
+    // Stop or inch forward. Currently set to STOP.
+    set_motors(0, 0);
+  }
+}
+
+// ----------------------------
+// Helper: Read Sensors
+// Returns: Number of active sensors
+// Updates: global 'error' variable
+// ----------------------------
+int read_sensors() {
+  int active_count = 0;
+  float weighted_sum = 0;
+  
+  for (int i = 0; i < 5; i++) {
+    // Read Raw Value
+    int raw = analogRead(i);
+    
+    // Apply Threshold (1 = Line Detected/Black, 0 = Surface/White)
+    if (raw > threshold) {
+      sensors[i] = 1;
+      active_count++;
+      weighted_sum += weights[i];
+    } else {
+      sensors[i] = 0;
+    }
+  }
+
+  if (active_count > 0) {
+    error = weighted_sum / active_count;
+  }
+  
+  return active_count;
+}
+
+// ----------------------------
+// Helper: Motor Control (EROBOTA16 Style)
+// speed: -255 to 255
+// ----------------------------
+void set_motors(int left_speed, int right_speed) {
+  
+  // --- Left Motor (Motor A) ---
+  if (left_speed > 0) {
+    digitalWrite(AIN1, HIGH); 
+    digitalWrite(AIN2, LOW); 
+    analogWrite(PWMA, left_speed);
+  } else if (left_speed < 0) {
+    digitalWrite(AIN1, LOW); 
+    digitalWrite(AIN2, HIGH); 
+    analogWrite(PWMA, -left_speed);
+  } else {
+    digitalWrite(AIN1, LOW); 
+    digitalWrite(AIN2, LOW); 
+    analogWrite(PWMA, 0);
+  }
+
+  // --- Right Motor (Motor B) ---
+  if (right_speed > 0) {
+    digitalWrite(BIN1, HIGH); 
+    digitalWrite(BIN2, LOW); 
+    analogWrite(PWMB, right_speed);
+  } else if (right_speed < 0) {
+    digitalWrite(BIN1, LOW); 
+    digitalWrite(BIN2, HIGH); 
+    analogWrite(PWMB, -right_speed);
+  } else {
+    digitalWrite(BIN1, LOW); 
+    digitalWrite(BIN2, LOW); 
+    analogWrite(PWMB, 0);
+  }
+}
