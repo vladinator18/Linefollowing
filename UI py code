@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-EROBOTA16 - ROG ALLY STANDARD (9600 Baud)
-- OPTIMIZED: Sends 20 commands/sec for stable 9600 baud connection
-- DUAL STICK: Left Stick = Speed, Right Stick = Turn
-- SMOOTHING: Ramp-up included to prevent power cutouts
+EROBOTA16 - TANK DRIVE CONTROL (9600 Baud)
+- LEFT STICK Y: Controls Left Motor
+- RIGHT STICK Y: Controls Right Motor
+- DIRECT MAPPING: No mixing, pure tank controls.
 """
 
 import tkinter as tk
@@ -21,8 +21,7 @@ class RobotController:
         self.invert_left = False
         self.invert_right = False
         self.last_send_time = 0
-        # 0.05s = 20Hz. This is perfect for 9600 baud (prevents lag)
-        self.send_interval = 0.05 
+        self.send_interval = 0.05 # 20Hz for 9600 baud
         
     def find_arduino(self):
         ports = serial.tools.list_ports.comports()
@@ -32,7 +31,6 @@ class RobotController:
         return None
     
     def connect(self, port, baud=9600):
-        """Connect to Arduino at Standard Speed"""
         try:
             self.ser = serial.Serial(port, baud, timeout=1)
             self.connected = True
@@ -50,11 +48,9 @@ class RobotController:
         self.connected = False
     
     def send_command(self, left, right, force=False):
-        """Send L/R speeds to Arduino with Rate Limiting"""
         if not self.connected: return False
         
         current_time = time.time()
-        # Rate limiting to prevent 9600 baud buffer overflow
         if not force and (current_time - self.last_send_time < self.send_interval):
             return False
             
@@ -64,7 +60,6 @@ class RobotController:
                 l_final = -left if self.invert_left else left
                 r_final = -right if self.invert_right else right
                 
-                # Standard Protocol
                 cmd = f"L:{int(l_final)};R:{int(r_final)}\n"
                 self.ser.write(cmd.encode())
                 self.last_send_time = current_time
@@ -79,15 +74,17 @@ class JoystickHandler:
         self.joystick = None
         self.running = True
         
-        # Default Mappings
-        self.axis_speed = 1  # Left Stick Y
-        self.axis_turn = 2   # Right Stick X
+        # Default Mappings for Tank Drive
+        # Axis 1 is usually Left Stick Y
+        # Axis 4 is usually Right Stick Y on Windows/Xbox Controllers
+        # (Use the Axis Scanner in UI to verify!)
+        self.axis_left_stick = 1
+        self.axis_right_stick = 4
         
-        # Default Tuning (Safe for 9600)
+        # Tuning
         self.deadzone = 0.10
-        self.turn_sensitivity = 0.7
         self.speed_limit = 1.0
-        self.smoothing = 0.25 # Mild smoothing for stability
+        self.smoothing = 0.25
         
         self.current_l = 0.0
         self.current_r = 0.0
@@ -98,14 +95,13 @@ class JoystickHandler:
         self.thread = threading.Thread(target=self.joystick_loop, daemon=True)
         self.thread.start()
     
-    def update_settings(self, turn_sens, speed_lim, deadzone, smooth, s_axis, t_axis):
-        self.turn_sensitivity = turn_sens
+    def update_settings(self, speed_lim, deadzone, smooth, l_axis, r_axis):
         self.speed_limit = speed_lim
         self.deadzone = deadzone
         self.smoothing = smooth
         try:
-            self.axis_speed = int(s_axis)
-            self.axis_turn = int(t_axis)
+            self.axis_left_stick = int(l_axis)
+            self.axis_right_stick = int(r_axis)
         except:
             pass
     
@@ -115,30 +111,23 @@ class JoystickHandler:
         scaled = (abs(value) - self.deadzone) / (1.0 - self.deadzone)
         return sign * scaled
     
-    def calculate_motor_speeds(self, speed_val, turn_val):
-        throttle = -speed_val
-        turn = turn_val
+    def calculate_motor_speeds(self, left_val, right_val):
+        # Invert inputs because "Up" on joysticks is usually negative
+        raw_l = -left_val
+        raw_r = -right_val
         
-        throttle = self.apply_deadzone(throttle)
-        turn = self.apply_deadzone(turn)
+        # 1. Deadzone
+        val_l = self.apply_deadzone(raw_l)
+        val_r = self.apply_deadzone(raw_r)
         
-        throttle *= self.speed_limit
-        turn_input = turn * self.turn_sensitivity
+        # 2. Speed Limit
+        val_l *= self.speed_limit
+        val_r *= self.speed_limit
         
-        # Mixing
-        left_target = throttle + turn_input
-        right_target = throttle - turn_input
-        
-        # Normalize
-        max_val = max(abs(left_target), abs(right_target))
-        if max_val > 1.0:
-            left_target /= max_val
-            right_target /= max_val
-            
-        # Smoothing
+        # 3. Smoothing (Ramp up/down)
         factor = 1.0 - self.smoothing
-        self.current_l += factor * (left_target - self.current_l)
-        self.current_r += factor * (right_target - self.current_r)
+        self.current_l += factor * (val_l - self.current_l)
+        self.current_r += factor * (val_r - self.current_r)
         
         return int(self.current_l * 255), int(self.current_r * 255)
 
@@ -153,13 +142,15 @@ class JoystickHandler:
                     pygame.event.pump()
                     
                     num_axes = self.joystick.get_numaxes()
-                    # Safe access to axes
-                    raw_speed = self.joystick.get_axis(self.axis_speed) if self.axis_speed < num_axes else 0.0
-                    raw_turn = self.joystick.get_axis(self.axis_turn) if self.axis_turn < num_axes else 0.0
                     
+                    # Read configured axes
+                    raw_l = self.joystick.get_axis(self.axis_left_stick) if self.axis_left_stick < num_axes else 0.0
+                    raw_r = self.joystick.get_axis(self.axis_right_stick) if self.axis_right_stick < num_axes else 0.0
+                    
+                    # Read all for scanner
                     all_axes = [self.joystick.get_axis(i) for i in range(min(num_axes, 6))]
 
-                    l_pwm, r_pwm = self.calculate_motor_speeds(raw_speed, raw_turn)
+                    l_pwm, r_pwm = self.calculate_motor_speeds(raw_l, raw_r)
                     self.callback(l_pwm, r_pwm, all_axes)
                 else:
                     self.joystick = None
@@ -176,7 +167,7 @@ class JoystickHandler:
 class RogAllyUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("EROBOTA16 - 9600 BAUD CONTROL")
+        self.root.title("EROBOTA16 - TANK DRIVE")
         self.root.geometry("900x750")
         self.root.configure(bg='#0d1117')
         
@@ -207,15 +198,14 @@ class RogAllyUI:
     
     def update_settings(self, _=None):
         try:
-            t_sens = self.turn_scale.get()
             s_lim = self.speed_scale.get()
             dead = self.dead_scale.get()
             smooth = self.smooth_scale.get()
             
-            s_axis = int(self.axis_speed_combo.get().split(" ")[0])
-            t_axis = int(self.axis_turn_combo.get().split(" ")[0])
+            l_axis = int(self.axis_left_combo.get().split(" ")[0])
+            r_axis = int(self.axis_right_combo.get().split(" ")[0])
             
-            self.joystick_handler.update_settings(t_sens, s_lim, dead, smooth, s_axis, t_axis)
+            self.joystick_handler.update_settings(s_lim, dead, smooth, l_axis, r_axis)
             
             self.controller.invert_left = self.inv_left_var.get()
             self.controller.invert_right = self.inv_right_var.get()
@@ -229,7 +219,7 @@ class RogAllyUI:
         t_frame = tk.Frame(header, bg=self.bg_card)
         t_frame.pack(side=tk.LEFT, padx=20, pady=10)
         tk.Label(t_frame, text="EROBOTA16", font=("Arial Black", 24), fg=self.accent_red, bg=self.bg_card).pack(anchor='w')
-        tk.Label(t_frame, text="STANDARD 9600 BAUD", font=("Arial", 10, "bold"), fg=self.text_gray, bg=self.bg_card).pack(anchor='w')
+        tk.Label(t_frame, text="TANK DRIVE (L STICK = L, R STICK = R)", font=("Arial", 10, "bold"), fg=self.text_gray, bg=self.bg_card).pack(anchor='w')
 
         c_frame = tk.Frame(header, bg=self.bg_card)
         c_frame.pack(side=tk.RIGHT, padx=20)
@@ -247,7 +237,7 @@ class RogAllyUI:
         left_col = tk.Frame(content, bg=self.bg_dark)
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
 
-        scanner_frame = tk.LabelFrame(left_col, text="Axis Scanner", bg=self.bg_dark, fg=self.accent_cyan)
+        scanner_frame = tk.LabelFrame(left_col, text="Axis Scanner (Move Sticks to Identify)", bg=self.bg_dark, fg=self.accent_cyan)
         scanner_frame.pack(fill=tk.X, pady=10)
         self.axis_labels = []
         for i in range(6):
@@ -266,20 +256,20 @@ class RogAllyUI:
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=10, pady=10)
         right_col.pack_propagate(False)
         
-        tk.Label(right_col, text="🎮 MAPPING", font=("Arial", 12, "bold"), fg=self.text_white, bg=self.bg_card).pack(pady=10)
+        tk.Label(right_col, text="🎮 INPUT MAPPING", font=("Arial", 12, "bold"), fg=self.text_white, bg=self.bg_card).pack(pady=10)
         axis_opts = [f"{i} (Generic)" for i in range(6)]
         
-        tk.Label(right_col, text="Speed Axis (Left Stick Y)", fg=self.text_gray, bg=self.bg_card).pack(anchor='w', padx=20)
-        self.axis_speed_combo = ttk.Combobox(right_col, values=axis_opts, state='readonly')
-        self.axis_speed_combo.set("1 (Generic)")
-        self.axis_speed_combo.pack(fill=tk.X, padx=20, pady=(0, 10))
-        self.axis_speed_combo.bind("<<ComboboxSelected>>", self.update_settings)
+        tk.Label(right_col, text="Left Motor Axis (L Stick Up/Down)", fg=self.text_gray, bg=self.bg_card).pack(anchor='w', padx=20)
+        self.axis_left_combo = ttk.Combobox(right_col, values=axis_opts, state='readonly')
+        self.axis_left_combo.set("1 (Generic)") # Usually Axis 1
+        self.axis_left_combo.pack(fill=tk.X, padx=20, pady=(0, 10))
+        self.axis_left_combo.bind("<<ComboboxSelected>>", self.update_settings)
 
-        tk.Label(right_col, text="Turn Axis (Right Stick X)", fg=self.text_gray, bg=self.bg_card).pack(anchor='w', padx=20)
-        self.axis_turn_combo = ttk.Combobox(right_col, values=axis_opts, state='readonly')
-        self.axis_turn_combo.set("2 (Generic)")
-        self.axis_turn_combo.pack(fill=tk.X, padx=20, pady=(0, 10))
-        self.axis_turn_combo.bind("<<ComboboxSelected>>", self.update_settings)
+        tk.Label(right_col, text="Right Motor Axis (R Stick Up/Down)", fg=self.text_gray, bg=self.bg_card).pack(anchor='w', padx=20)
+        self.axis_right_combo = ttk.Combobox(right_col, values=axis_opts, state='readonly')
+        self.axis_right_combo.set("4 (Generic)") # Usually Axis 4 on Xbox/ROG
+        self.axis_right_combo.pack(fill=tk.X, padx=20, pady=(0, 10))
+        self.axis_right_combo.bind("<<ComboboxSelected>>", self.update_settings)
 
         tk.Label(right_col, text="⚙ TUNING", font=("Arial", 12, "bold"), fg=self.text_white, bg=self.bg_card).pack(pady=10)
 
@@ -292,8 +282,7 @@ class RogAllyUI:
             s.pack(fill=tk.X)
             return s
 
-        self.smooth_scale = make_slider("Smoothing (Stability)", 0.0, 0.95, 0.25, 0.05)
-        self.turn_scale = make_slider("Turn Sensitivity", 0.1, 1.0, 0.7, 0.05)
+        self.smooth_scale = make_slider("Smoothing", 0.0, 0.95, 0.25, 0.05)
         self.speed_scale = make_slider("Max Speed Limit", 0.1, 1.0, 1.0, 0.1)
         self.dead_scale = make_slider("Deadzone", 0.0, 0.3, 0.1, 0.01)
 
