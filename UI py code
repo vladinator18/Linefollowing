@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-EROBOTA16 - ROG ALLY CONTROLLER V4 (Stable)
-- HIGH SPEED: Uses 115200 Baud
-- SMOOTHING: Prevents power spikes when both motors start
-- DUAL STICK: Left stick drive, Right stick turn
+EROBOTA16 - ROG ALLY STANDARD (9600 Baud)
+- OPTIMIZED: Sends 20 commands/sec for stable 9600 baud connection
+- DUAL STICK: Left Stick = Speed, Right Stick = Turn
+- SMOOTHING: Ramp-up included to prevent power cutouts
 """
 
 import tkinter as tk
@@ -21,7 +21,8 @@ class RobotController:
         self.invert_left = False
         self.invert_right = False
         self.last_send_time = 0
-        self.send_interval = 0.03  # Limit sends to ~30Hz to prevent flooding
+        # 0.05s = 20Hz. This is perfect for 9600 baud (prevents lag)
+        self.send_interval = 0.05 
         
     def find_arduino(self):
         ports = serial.tools.list_ports.comports()
@@ -30,8 +31,8 @@ class RobotController:
                 return p.device
         return None
     
-    def connect(self, port, baud=115200):
-        """Connect to Arduino at High Speed"""
+    def connect(self, port, baud=9600):
+        """Connect to Arduino at Standard Speed"""
         try:
             self.ser = serial.Serial(port, baud, timeout=1)
             self.connected = True
@@ -53,6 +54,7 @@ class RobotController:
         if not self.connected: return False
         
         current_time = time.time()
+        # Rate limiting to prevent 9600 baud buffer overflow
         if not force and (current_time - self.last_send_time < self.send_interval):
             return False
             
@@ -62,6 +64,7 @@ class RobotController:
                 l_final = -left if self.invert_left else left
                 r_final = -right if self.invert_right else right
                 
+                # Standard Protocol
                 cmd = f"L:{int(l_final)};R:{int(r_final)}\n"
                 self.ser.write(cmd.encode())
                 self.last_send_time = current_time
@@ -76,16 +79,16 @@ class JoystickHandler:
         self.joystick = None
         self.running = True
         
-        self.axis_speed = 1 
-        self.axis_turn = 2 
+        # Default Mappings
+        self.axis_speed = 1  # Left Stick Y
+        self.axis_turn = 2   # Right Stick X
         
-        # Tuning
+        # Default Tuning (Safe for 9600)
         self.deadzone = 0.10
         self.turn_sensitivity = 0.7
         self.speed_limit = 1.0
-        self.smoothing = 0.2 # 0.0 = Instant, 0.9 = Very Slow
+        self.smoothing = 0.25 # Mild smoothing for stability
         
-        # State for smoothing
         self.current_l = 0.0
         self.current_r = 0.0
         
@@ -132,18 +135,12 @@ class JoystickHandler:
             left_target /= max_val
             right_target /= max_val
             
-        # Apply Smoothing (Low Pass Filter)
-        # New = Old + Factor * (Target - Old)
-        # Factor 1.0 = Instant, Factor 0.1 = Slow
+        # Smoothing
         factor = 1.0 - self.smoothing
         self.current_l += factor * (left_target - self.current_l)
         self.current_r += factor * (right_target - self.current_r)
         
-        # Convert
-        left_speed = int(self.current_l * 255)
-        right_speed = int(self.current_r * 255)
-        
-        return left_speed, right_speed
+        return int(self.current_l * 255), int(self.current_r * 255)
 
     def joystick_loop(self):
         while self.running:
@@ -156,6 +153,7 @@ class JoystickHandler:
                     pygame.event.pump()
                     
                     num_axes = self.joystick.get_numaxes()
+                    # Safe access to axes
                     raw_speed = self.joystick.get_axis(self.axis_speed) if self.axis_speed < num_axes else 0.0
                     raw_turn = self.joystick.get_axis(self.axis_turn) if self.axis_turn < num_axes else 0.0
                     
@@ -167,7 +165,7 @@ class JoystickHandler:
                     self.joystick = None
                     self.callback(0, 0, [])
                 
-                time.sleep(0.02) # 50Hz Loop
+                time.sleep(0.02) 
             except Exception as e:
                 print(f"Joy error: {e}")
                 time.sleep(0.1)
@@ -178,8 +176,8 @@ class JoystickHandler:
 class RogAllyUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("EROBOTA16 - STABLE CONTROL")
-        self.root.geometry("1000x800")
+        self.root.title("EROBOTA16 - 9600 BAUD CONTROL")
+        self.root.geometry("900x750")
         self.root.configure(bg='#0d1117')
         
         self.controller = RobotController()
@@ -205,7 +203,6 @@ class RogAllyUI:
         self.current_left = l_pwm
         self.current_right = r_pwm
         self.raw_axes = all_axes
-        # Send to Arduino
         self.controller.send_command(l_pwm, r_pwm)
     
     def update_settings(self, _=None):
@@ -232,7 +229,7 @@ class RogAllyUI:
         t_frame = tk.Frame(header, bg=self.bg_card)
         t_frame.pack(side=tk.LEFT, padx=20, pady=10)
         tk.Label(t_frame, text="EROBOTA16", font=("Arial Black", 24), fg=self.accent_red, bg=self.bg_card).pack(anchor='w')
-        tk.Label(t_frame, text="HIGH SPEED + SMOOTHING", font=("Arial", 10, "bold"), fg=self.accent_green, bg=self.bg_card).pack(anchor='w')
+        tk.Label(t_frame, text="STANDARD 9600 BAUD", font=("Arial", 10, "bold"), fg=self.text_gray, bg=self.bg_card).pack(anchor='w')
 
         c_frame = tk.Frame(header, bg=self.bg_card)
         c_frame.pack(side=tk.RIGHT, padx=20)
@@ -246,6 +243,7 @@ class RogAllyUI:
         content = tk.Frame(self.root, bg=self.bg_dark)
         content.pack(fill=tk.BOTH, expand=True, padx=15)
 
+        # Left Column - Visualization
         left_col = tk.Frame(content, bg=self.bg_dark)
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
 
@@ -257,12 +255,13 @@ class RogAllyUI:
             lbl.pack(anchor='w', padx=10)
             self.axis_labels.append(lbl)
 
-        tk.Label(left_col, text="MOTOR OUTPUT", font=("Arial", 12, "bold"), fg=self.accent_green, bg=self.bg_dark).pack(pady=(20,5))
+        tk.Label(left_col, text="MOTORS", font=("Arial", 12, "bold"), fg=self.accent_green, bg=self.bg_dark).pack(pady=(20,5))
         self.l_bar = tk.Canvas(left_col, height=30, bg=self.bg_card, highlightthickness=0)
         self.l_bar.pack(fill=tk.X, padx=10, pady=5)
         self.r_bar = tk.Canvas(left_col, height=30, bg=self.bg_card, highlightthickness=0)
         self.r_bar.pack(fill=tk.X, padx=10, pady=5)
 
+        # Right Column - Config
         right_col = tk.Frame(content, bg=self.bg_card, width=350)
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=10, pady=10)
         right_col.pack_propagate(False)
@@ -293,7 +292,7 @@ class RogAllyUI:
             s.pack(fill=tk.X)
             return s
 
-        self.smooth_scale = make_slider("Smoothing (Prevent Spikes)", 0.0, 0.95, 0.3, 0.05)
+        self.smooth_scale = make_slider("Smoothing (Stability)", 0.0, 0.95, 0.25, 0.05)
         self.turn_scale = make_slider("Turn Sensitivity", 0.1, 1.0, 0.7, 0.05)
         self.speed_scale = make_slider("Max Speed Limit", 0.1, 1.0, 1.0, 0.1)
         self.dead_scale = make_slider("Deadzone", 0.0, 0.3, 0.1, 0.01)
@@ -317,7 +316,7 @@ class RogAllyUI:
         if not self.controller.connected:
             if self.controller.connect(self.port_combo.get()):
                 self.connect_btn.config(text="DISCONNECT", bg=self.accent_green)
-                self.status_lbl.config(text="CONNECTED (115200)", bg=self.accent_green)
+                self.status_lbl.config(text="CONNECTED (9600)", bg=self.accent_green)
             else:
                 messagebox.showerror("Error", "Failed")
         else:
