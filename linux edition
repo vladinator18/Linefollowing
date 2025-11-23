@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""
+STEAM DECK FIXED VERSION
+- Works with SteamOS (Linux)
+- Uses SDL_VIDEODRIVER=dummy so pygame can read controllers without opening a window.
+- Steam Deck Controller Axis Mapping Updated:
+    AXIS 0 = Left Stick X
+    AXIS 1 = Left Stick Y
+    AXIS 2 = Right Stick X
+    AXIS 3 = Right Stick Y
+    AXIS 5 = R2 Trigger (0 to 1)
+"""
+
+import os
+os.environ["SDL_VIDEODRIVER"] = "dummy"   # IMPORTANT FOR STEAM DECK
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import time
+import pygame
+import threading
+
+
+# ======================================================================
+#  Robot Serial Controller
+# ======================================================================
+class RobotController:
+    def __init__(self):
+        self.ser = None
+        self.connected = False
+        self.last_command_sent = None
+        self.last_send_time = 0
+        
+    def find_arduino(self):
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            if any(x in p.description for x in ['Arduino', 'CH340', 'USB Serial', 'CP210']):
+                return p.device
+        return None
+    
+    def connect(self, port, baud=9600):
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            self.connected = True
+            time.sleep(2)
+            return True
+        except Exception as e:
+            print(f"Error: {e}")
+            return False
+    
+    def disconnect(self):
+        if self.ser and self.ser.is_open:
+            self.send_raw("5")
+            time.sleep(0.1)
+            self.ser.close()
+        self.connected = False
+    
+    def send_raw(self, command):
+        if not self.connected:
+            return False
+        
+        now = time.time()
+        if command != self.last_command_sent or (now - self.last_send_time > 0.2):
+
+            try:
+                self.ser.write(f"{command}\n".encode())
+                self.last_command_sent = command
+                self.last_send_time = now
+                print(f"[TX] {command}")
+                return True
+            except:
+                return False
+
+        return False
+
+
+# ======================================================================
+#  Joystick Handler (Steam Deck Friendly)
+# ======================================================================
+class JoystickHandler:
+    def __init__(self, callback):
+        self.callback = callback
+        self.joystick = None
+        self.running = True
+        self.deadzone = 0.3
+
+        pygame.init()
+        pygame.joystick.init()
+
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def loop(self):
+        while self.running:
+            try:
+                if pygame.joystick.get_count() > 0:
+                    if self.joystick is None:
+                        self.joystick = pygame.joystick.Joystick(0)
+                        self.joystick.init()
+                        print("Controller Detected:", self.joystick.get_name())
+                    
+                    pygame.event.pump()
+
+                    # ---------- STEAM DECK AXIS MAP ----------
+                    ax0 = self.joystick.get_axis(0)   # LS X
+                    ax1 = self.joystick.get_axis(1)   # LS Y
+                    ax5 = 0
+                    if self.joystick.get_numaxes() > 5:
+                        ax5 = self.joystick.get_axis(5)  # R2 trigger
+
+                    axes = [self.joystick.get_axis(i)
+                            for i in range(min(self.joystick.get_numaxes(), 8))]
+
+                    # =============================================================
+                    # COMMAND LOGIC (Discrete)
+                    # =============================================================
+                    cmd = "5"
+
+                    if ax5 > 0.5:
+                        cmd = "6"  # STOP ALTERNATE
+                    else:
+                        # Dominant directional axis wins
+                        if abs(ax1) > abs(ax0) and abs(ax1) > self.deadzone:
+                            if ax1 < 0: cmd = "1"
+                            else: cmd = "2"
+                        elif abs(ax0) > abs(ax1) and abs(ax0) > self.deadzone:
+                            if ax0 < 0: cmd = "3"
+                            else: cmd = "4"
+
+                    self.callback(cmd, axes)
+
+                else:
+                    self.joystick = None
+                    self.callback("NC", [])
+
+                time.sleep(0.05)
+
+            except Exception as e:
+                print("Joystick Error:", e)
+                time.sleep(0.1)
+
+    def stop(self):
+        self.running = False
+
+
+# ======================================================================
+#  UI
+# ======================================================================
+class SteamDeckUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("EROBOTA16 - STEAM DECK")
+        self.root.geometry("600x450")
+        self.root.configure(bg='#0d1117')
+
+        self.controller = RobotController()
+
+        self.current_cmd = "5"
+        self.raw_axes = []
+
+        self.build_ui()
+        self.joystick = JoystickHandler(self.on_joy_update)
+        self.loop()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def on_joy_update(self, cmd, axes):
+        self.current_cmd = cmd
+        self.raw_axes = axes
+        if cmd != "NC":
+            self.controller.send_raw(cmd)
+
+    def build_ui(self):
+        header = tk.Label(self.root, text="Steam Deck Controller Mode", 
+                          font=("Arial Black", 18), fg="#00d9ff", bg="#0d1117")
+        header.pack(pady=10)
+
+        # PORT SELECTION
+        f = tk.Frame(self.root, bg="#0d1117")
+        f.pack()
+
+        self.port_combo = ttk.Combobox(f, width=20, state="readonly")
+        self.port_combo.pack(side=tk.LEFT, padx=5)
+
+        tk.Button(f, text="Scan", command=self.scan_ports).pack(side=tk.LEFT)
+        self.conn_btn = tk.Button(f, text="CONNECT", bg="red", fg="white",
+                                  command=self.toggle_conn)
+        self.conn_btn.pack(side=tk.LEFT, padx=5)
+
+        self.scan_ports()
+
+        self.cmd_label = tk.Label(self.root, text="5", font=("Arial Black", 72), 
+                                  fg="white", bg="#0d1117")
+        self.cmd_label.pack(pady=20)
+
+        self.desc_label = tk.Label(self.root, text="STOP", fg="#8b949e", bg="#0d1117", font=("Arial", 14))
+        self.desc_label.pack()
+
+        self.axis_label = tk.Label(self.root, text="Axes: []", fg="#8b949e", bg="#0d1117", font=("Courier", 10))
+        self.axis_label.pack(side=tk.BOTTOM, pady=10)
+
+    def scan_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo["values"] = ports
+        if ports:
+            self.port_combo.current(0)
+
+    def toggle_conn(self):
+        if not self.controller.connected:
+            if self.controller.connect(self.port_combo.get()):
+                self.conn_btn.config(text="DISCONNECT", bg="green")
+            else:
+                messagebox.showerror("Error", "Connection failed.")
+        else:
+            self.controller.disconnect()
+            self.conn_btn.config(text="CONNECT", bg="red")
+
+    def loop(self):
+        # update UI
+        self.cmd_label.config(text=self.current_cmd)
+
+        desc = {
+            "1": "FORWARD",
+            "2": "BACKWARD",
+            "3": "LEFT SPIN",
+            "4": "RIGHT SPIN",
+            "5": "STOP",
+            "6": "STOP (ALT)",
+            "NC": "NO CONTROLLER"
+        }.get(self.current_cmd, "?")
+
+        self.desc_label.config(text=desc)
+
+        self.axis_label.config(text=f"Axes: {[round(x,2) for x in self.raw_axes]}")
+
+        self.root.after(50, self.loop)
+
+    def close(self):
+        self.joystick.stop()
+        self.controller.disconnect()
+        self.root.destroy()
+
+
+# ======================================================================
+# MAIN
+# ======================================================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    SteamDeckUI(root)
+    root.mainloop()
